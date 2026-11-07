@@ -1,5 +1,9 @@
 use std::collections::HashSet;
 
+// ============================================================
+// Runtime: retained representation
+// ============================================================
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeNode {
     id: String,
@@ -15,10 +19,11 @@ pub enum NodeKind {
 }
 
 pub struct UiContext {
-    // Events received from the previous frame's hit testing.
+    // Clicks produced by previous-frame hit testing.
+    // Explicit widget IDs are globally unique.
     clicked: HashSet<String>,
 
-    // The actual retained content tree.
+    // The retained content tree.
     retained_tree: Option<RuntimeNode>,
 }
 
@@ -35,6 +40,7 @@ impl UiContext {
         self.clicked.insert(id.into());
     }
 
+    // Consume the click. Each click is dispatched at most once.
     pub fn take_click(&mut self, id: &str) -> bool {
         self.clicked.remove(id)
     }
@@ -63,19 +69,14 @@ impl UiContext {
 // Declarative Builder API
 // ============================================================
 
-// This callback exists only in the temporary Builder.
-// It is never stored in RuntimeNode.
-pub type ClickHandler<'a> = Box<dyn FnOnce() + 'a>;
-
-pub struct DivBuilder<'a> {
+pub struct DivBuilder {
     id: Option<&'static str>,
-    children: Vec<Element<'a>>,
+    children: Vec<Element>,
 }
 
-pub struct ButtonBuilder<'a> {
+pub struct ButtonBuilder {
     id: Option<&'static str>,
     label: String,
-    on_click: Option<ClickHandler<'a>>,
 }
 
 pub struct TextBuilder {
@@ -83,36 +84,36 @@ pub struct TextBuilder {
 }
 
 // Temporary declarative element description.
-pub enum Element<'a> {
-    Div(DivBuilder<'a>),
-    Button(ButtonBuilder<'a>),
+// No callbacks or borrowed component state are stored here.
+enum Element {
+    Div(DivBuilder),
+    Button(ButtonBuilder),
     Text(TextBuilder),
 }
 
-pub trait IntoElement<'a> {
-    fn into_element(self) -> Element<'a>;
+trait IntoElement {
+    fn into_element(self) -> Element;
 }
 
 // ------------------------------------------------------------
-// Constructors
+// Conpub structors
 // ------------------------------------------------------------
 
-pub fn div<'a>() -> DivBuilder<'a> {
+pub fn div() -> DivBuilder {
     DivBuilder {
         id: None,
         children: Vec::new(),
     }
 }
 
-pub fn button<'a>(label: impl Into<String>) -> ButtonBuilder<'a> {
+pub fn button(label: impl Into<String>) -> ButtonBuilder {
     ButtonBuilder {
         id: None,
         label: label.into(),
-        on_click: None,
     }
 }
 
-pub fn text(content: impl Into<String>) -> TextBuilder {
+pub fn p(content: impl Into<String>) -> TextBuilder {
     TextBuilder {
         content: content.into(),
     }
@@ -122,20 +123,20 @@ pub fn text(content: impl Into<String>) -> TextBuilder {
 // Element conversions
 // ------------------------------------------------------------
 
-impl<'a> IntoElement<'a> for DivBuilder<'a> {
-    fn into_element(self) -> Element<'a> {
+impl IntoElement for DivBuilder {
+    fn into_element(self) -> Element {
         Element::Div(self)
     }
 }
 
-impl<'a> IntoElement<'a> for ButtonBuilder<'a> {
-    fn into_element(self) -> Element<'a> {
+impl IntoElement for ButtonBuilder {
+    fn into_element(self) -> Element {
         Element::Button(self)
     }
 }
 
-impl<'a> IntoElement<'a> for TextBuilder {
-    fn into_element(self) -> Element<'a> {
+impl IntoElement for TextBuilder {
+    fn into_element(self) -> Element {
         Element::Text(self)
     }
 }
@@ -144,21 +145,20 @@ impl<'a> IntoElement<'a> for TextBuilder {
 // Div modifiers
 // ------------------------------------------------------------
 
-impl<'a> DivBuilder<'a> {
+impl DivBuilder {
     pub fn id(mut self, id: &'static str) -> Self {
         self.id = Some(id);
         self
     }
 
-    pub fn child(mut self, child: impl IntoElement<'a>) -> Self {
+    pub fn child(mut self, child: impl IntoElement) -> Self {
         self.children.push(child.into_element());
         self
     }
 
-    // Consumes the Builder.
-    // The resulting RuntimeNode contains no callbacks.
+    // Consume Builder and create the retained tree.
     pub fn build(self, cx: &mut UiContext) {
-        let tree = build_element(Element::Div(self), cx, "", 0);
+        let tree = build_element(Element::Div(self), "", 0);
 
         cx.reconcile(tree);
     }
@@ -168,19 +168,32 @@ impl<'a> DivBuilder<'a> {
 // Button modifiers
 // ------------------------------------------------------------
 
-impl<'a> ButtonBuilder<'a> {
+impl ButtonBuilder {
     pub fn id(mut self, id: &'static str) -> Self {
         self.id = Some(id);
         self
     }
 
-    // The callback may borrow local variables or &mut self.
-    // No 'static requirement.
-    pub fn on_click<F>(mut self, callback: F) -> Self
+    // Immediate-mode event handling.
+    //
+    // The callback:
+    // - Executes synchronously.
+    // - Is never stored in ButtonBuilder.
+    // - Is never stored in RuntimeNode.
+    // - Can freely borrow local variables and &mut self.
+    //
+    // An explicit globally unique ID is required because
+    // the parent path is not available at this point.
+    pub fn on_click<F>(self, cx: &mut UiContext, callback: F) -> Self
     where
-        F: FnOnce() + 'a,
+        F: FnOnce(),
     {
-        self.on_click = Some(Box::new(callback));
+        let id = self.id.expect("on_click requires an explicit widget ID");
+
+        if cx.take_click(id) {
+            callback();
+        }
+
         self
     }
 }
@@ -190,23 +203,18 @@ impl<'a> ButtonBuilder<'a> {
 // ============================================================
 
 pub fn resolve_id(parent: &str, explicit_id: Option<&'static str>, index: usize) -> String {
-    let segment = explicit_id
-        .map(str::to_owned)
-        .unwrap_or_else(|| index.to_string());
+    match explicit_id {
+        // Explicit IDs are globally unique.
+        Some(id) => id.to_owned(),
 
-    if parent.is_empty() {
-        segment
-    } else {
-        format!("{parent}/{segment}")
+        // Implicit IDs are positional and parent-scoped.
+        None if parent.is_empty() => index.to_string(),
+
+        None => format!("{parent}/{index}"),
     }
 }
 
-pub fn build_element<'a>(
-    element: Element<'a>,
-    cx: &mut UiContext,
-    parent_id: &str,
-    index: usize,
-) -> RuntimeNode {
+pub fn build_element(element: Element, parent_id: &str, index: usize) -> RuntimeNode {
     match element {
         Element::Div(div) => {
             let id = resolve_id(parent_id, div.id, index);
@@ -215,7 +223,7 @@ pub fn build_element<'a>(
                 .children
                 .into_iter()
                 .enumerate()
-                .map(|(index, child)| build_element(child, cx, &id, index))
+                .map(|(index, child)| build_element(child, &id, index))
                 .collect();
 
             RuntimeNode {
@@ -225,16 +233,8 @@ pub fn build_element<'a>(
             }
         }
 
-        Element::Button(mut button) => {
+        Element::Button(button) => {
             let id = resolve_id(parent_id, button.id, index);
-
-            // Dispatch the event synchronously.
-            // The callback is consumed and dropped here.
-            if cx.take_click(&id) {
-                if let Some(callback) = button.on_click.take() {
-                    callback();
-                }
-            }
 
             RuntimeNode {
                 id,
